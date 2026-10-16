@@ -10,12 +10,16 @@ Data flow for a batch of token ids `idx` with shape (B, T):
 Logits at position t are the model's prediction for token t+1. The causal mask guarantees
 position t only ever sees positions <= t, so one forward pass trains on T predictions at once.
 
+Generation reuses the same forward pass with a KV cache: keys/values of past tokens never
+change (causal mask), so each new token only computes its own row of attention.
+
 Usage:  python model.py      # print parameter count, sanity checks, and a speed benchmark
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import torch
@@ -36,14 +40,34 @@ class GPTConfig:
     dropout: float = 0.1
 
 
+class KVCache:
+    """Per-layer keys and values of every token processed so far, shape (B, nh, T_past, hd)."""
+
+    def __init__(self, n_layer: int):
+        self.k: list[torch.Tensor | None] = [None] * n_layer
+        self.v: list[torch.Tensor | None] = [None] * n_layer
+
+    def __len__(self) -> int:
+        return 0 if self.k[-1] is None else self.k[-1].size(2)
+
+    def update(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append this step's k, v for `layer` and return the full history including them."""
+        if self.k[layer] is not None:
+            k = torch.cat([self.k[layer], k], dim=2)
+            v = torch.cat([self.v[layer], v], dim=2)
+        self.k[layer], self.v[layer] = k, v
+        return k, v
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head self-attention where each position can only attend to itself and the past."""
 
-    def __init__(self, cfg: GPTConfig):
+    def __init__(self, cfg: GPTConfig, layer: int = 0):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0, "n_embd must be divisible by n_head"
         self.n_head = cfg.n_head
         self.head_dim = cfg.n_embd // cfg.n_head
+        self.layer = layer  # index into the KV cache
         # One Linear producing Q, K and V together: same math as three separate layers,
         # but a single larger matmul is faster.
         self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)
@@ -59,21 +83,27 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("causal_mask", mask.view(1, 1, cfg.block_size, cfg.block_size),
                              persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: KVCache | None = None) -> torch.Tensor:
         B, T, C = x.shape
+        # Tokens already in the cache. Read it before this layer appends, and read the LAST
+        # layer's length: earlier layers have already been updated during this forward pass.
+        past = len(cache) if cache is not None else 0
         q, k, v = self.qkv(x).split(C, dim=2)  # each (B, T, C)
         # Split the channels into heads and move the head axis forward so each head is an
         # independent attention computation: (B, T, C) -> (B, n_head, T, head_dim).
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        if cache is not None:
+            k, v = cache.update(self.layer, k, v)  # now (B, nh, past+T, hd)
 
-        # Attention scores: how much each query matches each key. (B, nh, T, T)
+        # Attention scores: how much each query matches each key. (B, nh, T, past+T)
         # Dividing by sqrt(head_dim) keeps the dot products ~unit variance; without it,
         # large scores saturate the softmax into near one-hot and gradients vanish.
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         # Causal mask: set scores for future keys to -inf so softmax gives them weight 0.
-        att = att.masked_fill(~self.causal_mask[:, :, :T, :T], float("-inf"))
+        # With a cache, the T new queries sit at absolute positions past..past+T-1.
+        att = att.masked_fill(~self.causal_mask[:, :, past:past + T, :past + T], float("-inf"))
         att = F.softmax(att, dim=-1)  # each row now sums to 1: a weighting over the past
         att = self.attn_dropout(att)
         y = att @ v  # weighted average of value vectors: (B, nh, T, head_dim)
@@ -102,30 +132,30 @@ class MLP(nn.Module):
 class Block(nn.Module):
     """Transformer block with pre-LayerNorm and residual connections."""
 
-    def __init__(self, cfg: GPTConfig):
+    def __init__(self, cfg: GPTConfig, layer: int = 0):
         super().__init__()
         self.ln1 = nn.LayerNorm(cfg.n_embd)
-        self.attn = CausalSelfAttention(cfg)
+        self.attn = CausalSelfAttention(cfg, layer)
         self.ln2 = nn.LayerNorm(cfg.n_embd)
         self.mlp = MLP(cfg)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: KVCache | None = None) -> torch.Tensor:
         # Pre-LN: normalize the *input* to each sub-layer, leave the residual path untouched.
         # The un-normalized "x +" highway lets gradients flow straight to early layers,
         # which makes deep stacks train stably without careful warmup tricks (vs. post-LN).
-        x = x + self.attn(self.ln1(x))
+        x = x + self.attn(self.ln1(x), cache)
         x = x + self.mlp(self.ln2(x))
         return x
 
 
 class GPT(nn.Module):
-    def __init__(self, cfg: GPTConfig):
+    def __init__(self, cfg: GPTConfig, verbose: bool = True):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)   # token id -> vector
         self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)   # position -> vector (learned)
         self.drop = nn.Dropout(cfg.dropout)
-        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        self.blocks = nn.ModuleList([Block(cfg, i) for i in range(cfg.n_layer)])
         self.ln_f = nn.LayerNorm(cfg.n_embd)  # pre-LN leaves the last block's output un-normalized
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         # Weight tying: the output head reuses the input embedding matrix. Both map between
@@ -134,9 +164,10 @@ class GPT(nn.Module):
         self.lm_head.weight = self.tok_emb.weight
 
         self.apply(self._init_weights)
-        print(f"GPT: {self.num_params() / 1e6:.2f}M parameters "
-              f"(n_layer={cfg.n_layer}, n_head={cfg.n_head}, n_embd={cfg.n_embd}, "
-              f"block_size={cfg.block_size}, vocab={cfg.vocab_size})")
+        if verbose:
+            print(f"GPT: {self.num_params() / 1e6:.2f}M parameters "
+                  f"(n_layer={cfg.n_layer}, n_head={cfg.n_head}, n_embd={cfg.n_embd}, "
+                  f"block_size={cfg.block_size}, vocab={cfg.vocab_size})")
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -155,16 +186,20 @@ class GPT(nn.Module):
         # .parameters() de-duplicates shared tensors, so the tied matrix is counted once.
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        """idx: (B, T) token ids. targets: (B, T) next-token ids, or None at inference."""
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
+                cache: KVCache | None = None):
+        """idx: (B, T) token ids. targets: (B, T) next-token ids, or None at inference.
+        cache: if given, idx continues the tokens already in it (and is appended to it)."""
         B, T = idx.shape
-        assert T <= self.cfg.block_size, f"sequence length {T} > block_size {self.cfg.block_size}"
-        pos = torch.arange(T, device=idx.device)
+        past = len(cache) if cache is not None else 0
+        assert past + T <= self.cfg.block_size, \
+            f"sequence length {past + T} > block_size {self.cfg.block_size}"
+        pos = torch.arange(past, past + T, device=idx.device)
         # (B,T,C) + (T,C): positions broadcast over the batch. Without position embeddings
         # attention is order-blind ("dog bites man" == "man bites dog").
         x = self.drop(self.tok_emb(idx) + self.pos_emb(pos))
         for block in self.blocks:
-            x = block(x)
+            x = block(x, cache)
         logits = self.lm_head(self.ln_f(x))  # (B, T, vocab): unnormalized next-token scores
 
         loss = None
@@ -173,6 +208,75 @@ class GPT(nn.Module):
             # classification problem "which of vocab_size tokens comes next?".
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
+
+    # ------------------------------------------------------------------ generation
+    @torch.no_grad()
+    def stream(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
+               top_k: int | None = None, top_p: float | None = None,
+               generator: torch.Generator | None = None) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        """Sample tokens one at a time, continuing `idx` (B, T).
+
+        Yields (next_ids (B,), probs (B, vocab)) per step, where probs is the full softmax
+        before top-k/top-p filtering (what the model believed, useful for visualization).
+        """
+        was_training = self.training
+        self.eval()
+        bs = self.cfg.block_size
+        ctx = idx[:, -bs:]
+        cache = KVCache(self.cfg.n_layer)
+        logits, _ = self(ctx, cache=cache)  # prefill: one pass over the whole prompt
+        try:
+            for _ in range(max_new_tokens):
+                probs = F.softmax(logits[:, -1].float(), dim=-1)
+                nxt = sample_next(logits[:, -1], temperature, top_k, top_p, generator)
+                yield nxt, probs
+                ctx = torch.cat([ctx, nxt[:, None]], dim=1)
+                if len(cache) < bs:
+                    logits, _ = self(nxt[:, None], cache=cache)  # one new token: O(T) work
+                else:
+                    # Context is full. Positions are learned absolute embeddings, so tokens
+                    # can't slide left inside the cache; re-prefill from the last 3/4 of the
+                    # window instead, which buys bs/4 more cheap steps before the next refill.
+                    ctx = ctx[:, -(bs * 3 // 4):]
+                    cache = KVCache(self.cfg.n_layer)
+                    logits, _ = self(ctx, cache=cache)
+        finally:
+            self.train(was_training)
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, **kwargs) -> torch.Tensor:
+        """Return idx extended by max_new_tokens sampled tokens: (B, T + max_new_tokens)."""
+        new = [nxt[:, None] for nxt, _ in self.stream(idx, max_new_tokens, **kwargs)]
+        return torch.cat([idx, *new], dim=1)
+
+
+def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int | None = None,
+                top_p: float | None = None, generator: torch.Generator | None = None) -> torch.Tensor:
+    """Pick one token id per row of `logits` (B, vocab).
+
+    temperature: <1 sharpens the distribution (safer, more repetitive), >1 flattens it
+                 (more surprising, more typos). 0 means greedy argmax.
+    top_k:       only the k most likely tokens may be sampled.
+    top_p:       nucleus sampling: only the smallest set of tokens whose probabilities sum
+                 to >= p may be sampled. Adapts to confidence: 1 candidate when the model
+                 is sure, many when it isn't.
+    """
+    if temperature == 0:
+        return logits.argmax(dim=-1)
+    logits = logits.float() / temperature
+    if top_k is not None and top_k < logits.size(-1):
+        kth = torch.topk(logits, top_k, dim=-1).values[:, -1:]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p is not None and top_p < 1.0:
+        sorted_logits, order = torch.sort(logits, dim=-1, descending=True)
+        sorted_probs = F.softmax(sorted_logits, dim=-1)
+        # Drop a token if the tokens ranked above it already reach top_p. Subtracting its own
+        # probability keeps the token that crosses the threshold, so at least one survives.
+        drop = (sorted_probs.cumsum(dim=-1) - sorted_probs) >= top_p
+        sorted_logits = sorted_logits.masked_fill(drop, float("-inf"))
+        logits = torch.full_like(logits, float("-inf")).scatter(-1, order, sorted_logits)
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, 1, generator=generator).squeeze(-1)
 
 
 def _benchmark(cfg: GPTConfig, batch_size: int, steps: int = 5) -> float:

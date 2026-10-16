@@ -257,6 +257,7 @@ footer { margin-top: 32px; color: var(--ink-3); font-size: 14px; font-style: ita
           <button class="btn primary" id="go">Generate</button>
           <button class="btn" id="stop" disabled>Stop</button>
           <button class="btn" id="cont" disabled title="Use the whole page as the next prompt">Continue</button>
+          <button class="btn" id="share" disabled title="Copy a link that reproduces this exact generation">Share</button>
           <span class="kbd">Ctrl + Enter</span>
           <span class="status" id="status"></span>
         </div>
@@ -409,17 +410,20 @@ page.addEventListener("mouseleave", () => tip.classList.remove("on"));
 function esc(s) { return s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
 /* ---------- generation ---------- */
-function generate(promptText) {
+function generate(promptText, after) {
   stop();
   clearSelection();
   state.tokens = [];
   page.textContent = "";
   page.classList.remove("empty");
   const cur = document.createElement("span"); cur.className = "cursor"; page.append(cur);
+  // Always sample with an explicit seed (random if the box is empty) so Share can replay it.
+  const seed = /^\d+$/.test($("#seed").value.trim()) ? $("#seed").value.trim() : String(Math.floor(Math.random() * 1e9));
   const params = new URLSearchParams({
     prompt: promptText, temperature: $("#temp").value, top_p: $("#topp").value,
-    tokens: $("#ntok").value, seed: $("#seed").value.trim(),
+    tokens: $("#ntok").value, seed,
   });
+  state.last = params;
   const es = new EventSource("/api/generate?" + params);
   state.es = es;
   const t0 = performance.now();
@@ -431,7 +435,10 @@ function generate(promptText) {
     addToken(JSON.parse(e.data)); n++;
     statusEl.textContent = `${n} tokens · ${fmt(n / ((performance.now() - t0) / 1000), 0)} tok/s`;
   });
-  es.addEventListener("done", () => finish(`${n} tokens · ${fmt((performance.now() - t0) / 1000, 1)} s`));
+  es.addEventListener("done", () => {
+    finish(`${n} tokens · ${fmt((performance.now() - t0) / 1000, 1)} s · seed ${seed}`);
+    after?.();
+  });
   es.onerror = () => finish(n ? `stopped at ${n} tokens` : "could not reach the server");
 }
 function finish(msg) {
@@ -441,9 +448,20 @@ function finish(msg) {
   statusEl.textContent = msg;
 }
 function stop() { if (state.es) finish("stopped"); }
-function setBusy(b) { $("#go").disabled = b; $("#stop").disabled = !b; $("#cont").disabled = b || !state.tokens.length; }
+function setBusy(b) {
+  $("#go").disabled = b; $("#stop").disabled = !b;
+  $("#cont").disabled = $("#share").disabled = b || !state.tokens.length;
+}
 $("#go").onclick = () => generate($("#prompt").value);
 $("#stop").onclick = stop;
+$("#share").onclick = async () => {
+  const q = new URLSearchParams(state.last);
+  q.set("run", "");
+  if (state.sel !== null) q.set("lens", state.sel);
+  const url = `${location.origin}${location.pathname}?${q}`;
+  try { await navigator.clipboard.writeText(url); statusEl.textContent = "link copied"; }
+  catch { prompt("Copy this link:", url); }
+};
 $("#cont").onclick = () => { const all = state.tokens.map(t => t.text).join(""); $("#prompt").value = all; generate(all); };
 document.addEventListener("keydown", e => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !$("#go").disabled) { e.preventDefault(); generate($("#prompt").value); }
@@ -452,11 +470,16 @@ document.addEventListener("keydown", e => {
 
 /* ---------- attention lens ---------- */
 const BLOCK = () => state.info?.config.block_size ?? 128;
-page.addEventListener("click", async e => {
+page.addEventListener("click", e => {
   const el = e.target.closest(".t");
   if (!el || state.es) return;
   const i = +el.dataset.i;
   if (state.sel === i) { clearSelection(); paint(); return; }
+  openLens(i);
+});
+async function openLens(i) {
+  const el = state.tokens[i]?.el;
+  if (!el) return;
   const start = Math.max(0, i - BLOCK() + 1);
   const ids = state.tokens.slice(start, i + 1).map(t => t.id);
   const r = await fetch("/api/attention?ids=" + ids.join(","));
@@ -466,7 +489,7 @@ page.addEventListener("click", async e => {
   el.classList.add("sel");
   state.sel = i; state.attn = { start, maps: data.attn };
   renderLens(); paint();
-});
+}
 function clearSelection() {
   state.sel = null; state.attn = null;
   state.tokens.forEach(t => t.el?.classList.remove("sel"));
@@ -503,7 +526,8 @@ function renderLens() {
   const ranked = state.attn.row.map((w, j) => [w, j]).sort((a, b) => b[0] - a[0]).slice(0, 5);
   html += `<div class="top-att">` + ranked.map(([w, j]) => {
     const tk = state.tokens[state.attn.start + j];
-    return `<div><span>${esc(visible(tk.text))}${state.attn.start + j === state.sel ? " (itself)" : ""}</span><span class="num">${pct(w)}</span><span class="bar"><i style="width:${(w * 100).toFixed(1)}%"></i></span></div>`;
+    const back = state.sel - (state.attn.start + j);
+    return `<div><span>${esc(visible(tk.text))} <span class="kbd">${back ? back + " back" : "itself"}</span></span><span class="num">${pct(w)}</span><span class="bar"><i style="width:${(w * 100).toFixed(1)}%"></i></span></div>`;
   }).join("") + `</div>`;
   // Every head at a glance: the token it attends to most.
   html += `<div class="heads" style="--h:${nH}"><span></span>` + Array.from({ length: nH }, (_, h) => `<span class="lbl">H${h + 1}</span>`).join("");
@@ -605,7 +629,8 @@ loadInfo();
   if (q.has("prompt")) $("#prompt").value = q.get("prompt");
   for (const [key, id] of [["temperature", "temp"], ["top_p", "topp"], ["tokens", "ntok"], ["seed", "seed"]])
     if (q.has(key)) { $("#" + id).value = q.get(key); $("#" + id).dispatchEvent(new Event("input")); }
-  if (q.has("run")) generate($("#prompt").value);
+  const lens = parseInt(q.get("lens"), 10);
+  if (q.has("run")) generate($("#prompt").value, Number.isInteger(lens) ? () => openLens(lens) : undefined);
 })();
 </script>
 </body>

@@ -29,9 +29,9 @@ import torch.nn.functional as F
 
 @dataclass
 class GPTConfig:
-    # Defaults (~5.3M params) were picked by benchmarking on an 8-core laptop CPU: ~5k
-    # tokens/sec trains for ~27 epochs of Tiny Shakespeare in 30 min. A 384-wide model
-    # (11.5M) only manages ~9 epochs in the same time. See README for the comparison.
+    # Defaults (~5.3M params) were picked by benchmarking on a laptop CPU (8 torch threads):
+    # ~2,300 tokens/sec trains for ~10.6 epochs of Tiny Shakespeare in 30 min. A 384-wide
+    # model (11.5M) runs at ~1,360 tokens/sec, only ~7 epochs. See README for results.
     vocab_size: int = 2048   # must match the tokenizer
     block_size: int = 128    # max context length (tokens the model can look back over)
     n_layer: int = 6         # number of transformer blocks

@@ -182,6 +182,14 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    @classmethod
+    def from_checkpoint(cls, path: str, verbose: bool = False) -> tuple["GPT", dict]:
+        """Load a checkpoint written by train.py. Returns (model in eval mode, checkpoint dict)."""
+        ckpt = torch.load(path, map_location="cpu")
+        model = cls(GPTConfig(**ckpt["config"]), verbose=verbose)
+        model.load_state_dict(ckpt["model"])
+        return model.eval(), ckpt
+
     def num_params(self) -> int:
         # .parameters() de-duplicates shared tensors, so the tied matrix is counted once.
         return sum(p.numel() for p in self.parameters())
@@ -206,7 +214,7 @@ class GPT(nn.Module):
         if targets is not None:
             # Flatten to (B*T, vocab) vs (B*T,): every position is an independent
             # classification problem "which of vocab_size tokens comes next?".
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss
 
     # ------------------------------------------------------------------ generation

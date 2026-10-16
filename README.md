@@ -7,15 +7,18 @@ byte-level BPE tokenizer, a GPT-style transformer, a training loop, KV-cached sa
 web playground that shows what the model is thinking, token by token. Everything trains on a
 laptop CPU in 30 minutes.
 
+![Bard Lab: the attention lens on a generated line](docs/bard-lab-attention.png)
+
 ```
 tokenizer.py   byte-level BPE, trained from scratch (2,048-token vocab)
 model.py       decoder-only transformer + KV cache + temperature / top-k / top-p sampling
 data.py        cached tokenization, contiguous train/val split, batch sampling
 train.py       AdamW, warmup + time-budgeted cosine LR, grad clipping, checkpoints, resume
 sample.py      stream generated text in the terminal
+evaluate.py    exact loss on the full validation split, per token and per character
 server.py      stdlib-only web server (Server-Sent Events) for the playground
 web/           Bard Lab: the single-page UI
-tests/         66 tests: tokenizer, model, generation, data and server
+tests/         68 tests: tokenizer, model, generation, data, eval and server
 ```
 
 ## Quick start
@@ -31,7 +34,7 @@ python server.py              # open http://localhost:8000 for Bard Lab
 ```
 
 `tokenizer.json` is committed, so you can skip retraining the tokenizer
-(`python tokenizer.py --vocab-size 2048` rebuilds it in about 30 s).
+(`python tokenizer.py --vocab-size 2048` rebuilds it in about 2 seconds).
 
 ## Bard Lab
 
@@ -79,7 +82,84 @@ greedy loop exactly.
 
 ## Results
 
-_Filled in after the training run; see below._
+One 30-minute run of `python train.py` on a laptop CPU (8 torch threads, ~2,350 tokens/s):
+
+| | |
+|---|---|
+| Model | 5.30M parameters: 6 layers, 4 heads, 256 wide, 128-token context |
+| Training | 1,810 steps × 2,048 tokens = 3.7M tokens (≈10.6 passes over the training split) |
+| Val loss (`evaluate.py`, full split) | **3.99 nats/token**, perplexity **54.2** (random guessing: 2,048) |
+| Per character | **1.455 nats/char** (2.10 bits/char) |
+
+For a rough sense of scale, nanoGPT's character-level Shakespeare baseline reports 1.47
+nats/char with a 10.7M-parameter model on an A100. Tokenizers and context lengths differ, so
+it isn't an exact comparison, but a BPE vocabulary gets a lot out of a small CPU budget.
+
+| step | minutes | train loss | val loss |
+|---:|---:|---:|---:|
+| 250 | 3.6 | 4.687 | 4.808 |
+| 500 | 7.5 | 4.229 | 4.487 |
+| 750 | 11.3 | 3.964 | 4.338 |
+| 1000 | 15.2 | 3.781 | 4.180 |
+| 1250 | 21.1 | 3.632 | 4.117 |
+| 1500 | 25.0 | 3.522 | 4.049 |
+| 1810 | 30.0 | 3.457 | 4.006 |
+
+Val loss was still falling when the budget ran out, so a longer run (`python train.py
+--resume --minutes 60` extends this one) should help. The widening train/val gap shows the
+model starting to memorize the 1 MB corpus, which is where dropout and weight decay earn
+their keep.
+
+**Why this size?** A 384-wide model (11.5M params) runs at ~1,360 tokens/s on the same CPU
+and would see only ~7 epochs in 30 minutes. On a fixed CPU budget, the smaller model that
+sees more data wins.
+
+### Samples
+
+`python sample.py --seed 7` (temperature 0.8, top-p 0.95):
+
+```
+ROMEO:
+If she will bound to thee?
+
+JULIET:
+I will not see that I speak.
+
+ROMEO:
+My lord, I'll need my lord.
+
+JULIET:
+My fair boy, are it so lived on the crown.
+
+Nurse:
+I hear me see how to me, and then.
+```
+
+`python sample.py --prompt "JULIET:
+O Romeo, Romeo," --temperature 0.7 --seed 3`:
+
+```
+JULIET:
+O Romeo, Romeo, that's a word?
+
+Nurse:
+Benetter:
+I have been by this lion than hel;
+And by the expression of the fought,
+Unless I should not speak so:
+But I action is a traitor in thy feast,
+And pluck'd by thy kinsman, and my lord.
+
+ROMEO:
+Away with my soul; and thou be gone,
+But by my wives to thee, I'll do no more.
+```
+
+It learned the script format, verse line lengths, archaic grammar ("pluck'd", "thou be
+gone") and which characters belong in which play: Romeo, Juliet, the Nurse, Mercutio and
+Lady Capulet show up together. Meaning is still mostly beyond a 5M-parameter model.
+
+![Bard Lab in light mode: the surprise heatmap](docs/bard-lab-light.png)
 
 ## Tests
 

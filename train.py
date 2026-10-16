@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-batches", type=int, default=40)
+    p.add_argument("--log-every", type=int, default=50, help="print training loss every N steps")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--threads", type=int, default=None, help="torch CPU threads (default: torch's choice)")
     p.add_argument("--resume", action="store_true")
@@ -186,6 +187,10 @@ def main() -> None:
             step += 1
             win_steps += 1
             elapsed = elapsed_before + time.perf_counter() - t0
+            if step % args.log_every == 0 and step % args.eval_every:
+                tps = win_steps * tokens_per_step / (time.perf_counter() - win_t)
+                print(f"step {step:6d} | {elapsed / 60:5.1f} min | loss  {loss.item():.4f} | "
+                      f"lr {lr:.2e} | {tps:,.0f} tok/s", flush=True)
             if step % args.eval_every == 0:
                 now = time.perf_counter()
                 evaluate(elapsed, now - win_t, win_steps)

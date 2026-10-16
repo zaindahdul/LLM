@@ -87,3 +87,12 @@ def test_low_temperature_concentrates_mass():
     cold = (sample_next(logits, temperature=0.2, generator=g) == 0).float().mean()
     hot = (sample_next(logits, temperature=2.0, generator=g) == 0).float().mean()
     assert cold > 0.95 > hot
+
+
+def test_attention_maps_are_causal_distributions():
+    m = _model()
+    maps = m.attention_maps(torch.randint(0, SMALL.vocab_size, (1, 12)))
+    assert maps.shape == (SMALL.n_layer, 1, SMALL.n_head, 12, 12)
+    torch.testing.assert_close(maps.sum(-1), torch.ones(SMALL.n_layer, 1, SMALL.n_head, 12))
+    assert maps.triu(diagonal=1).abs().max() == 0  # nothing attends to the future
+    assert all(not b.attn.record_attn and b.attn.last_attn is None for b in m.blocks)

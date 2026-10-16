@@ -68,6 +68,10 @@ class CausalSelfAttention(nn.Module):
         self.n_head = cfg.n_head
         self.head_dim = cfg.n_embd // cfg.n_head
         self.layer = layer  # index into the KV cache
+        # Set record_attn = True to keep the last attention pattern (B, nh, T, T_keys) in
+        # last_attn, for visualization. Off by default: it holds a reference per layer.
+        self.record_attn = False
+        self.last_attn: torch.Tensor | None = None
         # One Linear producing Q, K and V together: same math as three separate layers,
         # but a single larger matmul is faster.
         self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)
@@ -105,6 +109,8 @@ class CausalSelfAttention(nn.Module):
         # With a cache, the T new queries sit at absolute positions past..past+T-1.
         att = att.masked_fill(~self.causal_mask[:, :, past:past + T, :past + T], float("-inf"))
         att = F.softmax(att, dim=-1)  # each row now sums to 1: a weighting over the past
+        if self.record_attn:
+            self.last_attn = att.detach()
         att = self.attn_dropout(att)
         y = att @ v  # weighted average of value vectors: (B, nh, T, head_dim)
 
@@ -189,6 +195,19 @@ class GPT(nn.Module):
         model = cls(GPTConfig(**ckpt["config"]), verbose=verbose)
         model.load_state_dict(ckpt["model"])
         return model.eval(), ckpt
+
+    @torch.no_grad()
+    def attention_maps(self, idx: torch.Tensor) -> torch.Tensor:
+        """Attention weights for every layer and head: (n_layer, B, n_head, T, T)."""
+        attns = [b.attn for b in self.blocks]
+        for a in attns:
+            a.record_attn = True
+        try:
+            self(idx)
+            return torch.stack([a.last_attn for a in attns])
+        finally:
+            for a in attns:
+                a.record_attn, a.last_attn = False, None
 
     def num_params(self) -> int:
         # .parameters() de-duplicates shared tensors, so the tied matrix is counted once.

@@ -1,0 +1,4 @@
+# CPU build is fine; for CUDA see https://pytorch.org/get-started/locally/
+torch>=2.2
+numpy
+pytest>=8

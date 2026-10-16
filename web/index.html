@@ -350,7 +350,7 @@ function paintOne(t, i) {
   const el = t.el;
   if (state.sel !== null) {
     const w = attnWeight(i);
-    el.style.backgroundColor = w > 0 ? `rgb(var(--attn) / ${Math.min(0.85, Math.sqrt(w) * 0.95).toFixed(3)})` : "";
+    el.style.backgroundColor = w > 0 ? `rgb(var(--attn) / ${(w * 0.85).toFixed(3)})` : "";
     el.style.opacity = i > state.sel ? ".35" : "";
     return;
   }
@@ -585,9 +585,10 @@ function drawChart(log) {
   let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Training and validation loss by step">`;
   for (let v = y0; v <= y1 + 1e-9; v += step)
     s += `<line class="grid-l" x1="${m.l}" x2="${W - m.r}" y1="${Y(v)}" y2="${Y(v)}"/><text class="axis-t" x="${m.l - 6}" y="${Y(v) + 3.5}" text-anchor="end">${v.toFixed(1)}</text>`;
-  const ticks = 4;
-  for (let k = 0; k <= ticks; k++) {
-    const v = Math.round(x1 * k / ticks);
+  // Round tick spacing (1, 2 or 5 x 10^k) giving at most ~5 ticks.
+  const raw = x1 / 4, mag = Math.pow(10, Math.floor(Math.log10(raw || 1)));
+  const tickStep = [1, 2, 5, 10].map(f => f * mag).find(t => t >= raw);
+  for (let v = 0; v <= x1; v += tickStep) {
     s += `<text class="axis-t" x="${X(v)}" y="${H - 6}" text-anchor="middle">${v >= 1000 ? (v / 1000).toFixed(v % 1000 ? 1 : 0) + "k" : v}</text>`;
   }
   const path = key => "M" + log.map(r => `${X(r.step).toFixed(1)},${Y(r[key]).toFixed(1)}`).join("L");

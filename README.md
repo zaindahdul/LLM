@@ -116,7 +116,7 @@ sees more data wins.
 
 ### Samples
 
-`python sample.py --seed 7` (temperature 0.8, top-p 0.95):
+`python sample.py --seed 7 --num 2`, second sample (temperature 0.8, top-p 0.95):
 
 ```
 ROMEO:

@@ -135,8 +135,7 @@ Nurse:
 I hear me see how to me, and then.
 ```
 
-`python sample.py --prompt "JULIET:
-O Romeo, Romeo," --temperature 0.7 --seed 3`:
+`python sample.py --prompt "JULIET:\nO Romeo, Romeo," --temperature 0.7 --seed 3`:
 
 ```
 JULIET:

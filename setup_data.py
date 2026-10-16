@@ -19,8 +19,11 @@ def main() -> None:
     print(f"Downloading {URL} ...")
     with urllib.request.urlopen(URL, timeout=60) as resp:
         data = resp.read()
-    # Decode and write back as UTF-8 so the file is valid UTF-8 regardless of the source encoding.
-    OUT.write_text(data.decode("utf-8"), encoding="utf-8")
+    data.decode("utf-8")  # fail loudly now if the download isn't valid UTF-8
+    # Write the bytes untouched: write_text would turn every "
+" into "
+" on Windows.
+    OUT.write_bytes(data)
     print(f"Saved {len(data):,} bytes to {OUT}")
 
 
